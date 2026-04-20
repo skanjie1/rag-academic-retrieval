@@ -20,14 +20,14 @@ def load_config(config_path: str = "configs/config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def fetch_abstracts(query: str, limit: int = 600) -> list[dict]:
+def fetch_abstracts_semantic_scholar(query: str, limit: int = 600) -> list[dict]:
     """Fetch paper abstracts from Semantic Scholar API."""
     url = "https://api.semanticscholar.org/graph/v1/paper/search"
     papers = []
     offset = 0
     batch_size = 100
 
-    print(f"Fetching abstracts for query: '{query}'")
+    print(f"Fetching abstracts from Semantic Scholar for query: '{query}'")
     while len(papers) < limit:
         params = {
             "query": query,
@@ -35,7 +35,15 @@ def fetch_abstracts(query: str, limit: int = 600) -> list[dict]:
             "offset": offset,
             "fields": "title,abstract,authors,year,venue",
         }
-        response = requests.get(url, params=params)
+        try:
+            response = requests.get(url, params=params, timeout=30)
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+            break
+
+        if response.status_code == 429:
+            print("Rate limited by Semantic Scholar API.")
+            break
         if response.status_code != 200:
             print(f"API error: {response.status_code}")
             break
@@ -47,11 +55,51 @@ def fetch_abstracts(query: str, limit: int = 600) -> list[dict]:
         ]
         papers.extend(batch)
         offset += batch_size
+        print(f"  Fetched {len(papers)} papers so far...")
 
         if not data.get("data"):
             break
 
     print(f"Fetched {len(papers)} papers with valid abstracts")
+    return papers[:limit]
+
+
+def fetch_abstracts_huggingface(limit: int = 600) -> list[dict]:
+    """Fetch NLP paper abstracts from Hugging Face datasets (fallback)."""
+    from datasets import load_dataset
+
+    print("Fetching abstracts from Hugging Face (CShorten/ML-ArXiv-Papers)...")
+    dataset = load_dataset("CShorten/ML-ArXiv-Papers", split="train")
+
+    # Filter for NLP/transformer-related papers
+    nlp_keywords = [
+        "language model", "transformer", "attention", "NLP", "natural language",
+        "BERT", "GPT", "text", "token", "embedding", "sequence", "translation",
+        "sentiment", "summarization", "question answering", "named entity",
+    ]
+
+    papers = []
+    for item in dataset:
+        title = item.get("title", "")
+        abstract = item.get("abstract", "")
+        if not abstract or len(abstract) < 100:
+            continue
+
+        # Check if paper is NLP-related
+        combined = (title + " " + abstract).lower()
+        if any(kw.lower() in combined for kw in nlp_keywords):
+            papers.append({
+                "title": title.strip(),
+                "abstract": abstract.strip(),
+                "year": None,
+                "venue": "arXiv",
+                "paperId": "",
+            })
+
+        if len(papers) >= limit:
+            break
+
+    print(f"Filtered {len(papers)} NLP-related papers from dataset")
     return papers[:limit]
 
 
@@ -90,6 +138,10 @@ def build_index(
     output_dir: str,
 ) -> None:
     """Generate embeddings and build FAISS index."""
+    if len(chunks) == 0:
+        print("No chunks to index. Check that the fetch returned papers.")
+        return
+
     model_name = config["embedding"]["base_model"]
     print(f"Loading embedding model: {model_name}")
     model = SentenceTransformer(model_name)
@@ -125,6 +177,7 @@ def main():
     parser = argparse.ArgumentParser(description="RAG Ingestion Pipeline")
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--fetch", action="store_true", help="Fetch from Semantic Scholar API")
+    parser.add_argument("--hf", action="store_true", help="Fetch from Hugging Face datasets (fallback)")
     parser.add_argument("--query", default="natural language processing transformers")
     parser.add_argument("--limit", type=int, default=600)
     parser.add_argument("--data_dir", default="data")
@@ -133,16 +186,28 @@ def main():
 
     config = load_config(args.config)
 
-    if args.fetch:
-        papers = fetch_abstracts(args.query, args.limit)
-        corpus_path = Path(args.data_dir) / "nlp_abstracts.json"
-        corpus_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(corpus_path, "w") as f:
-            json.dump(papers, f, indent=2)
+    if args.hf:
+        papers = fetch_abstracts_huggingface(args.limit)
+    elif args.fetch:
+        papers = fetch_abstracts_semantic_scholar(args.query, args.limit)
+        if not papers:
+            print("Semantic Scholar failed. Falling back to Hugging Face dataset...")
+            papers = fetch_abstracts_huggingface(args.limit)
     else:
         corpus_path = config["data"]["corpus_path"]
         with open(corpus_path, "r") as f:
             papers = json.load(f)
+
+    if not papers:
+        print("No papers fetched from any source.")
+        return
+
+    # Save corpus
+    corpus_path = Path(args.data_dir) / "nlp_abstracts.json"
+    corpus_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(corpus_path, "w") as f:
+        json.dump(papers, f, indent=2)
+    print(f"Saved {len(papers)} papers to {corpus_path}")
 
     chunks, metadatas = chunk_documents(papers, config)
     build_index(chunks, metadatas, config, args.index_path)
