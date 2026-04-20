@@ -1,0 +1,27 @@
+# Data files (too large for git)
+data/nlp_abstracts.json
+data/faiss_index/
+data/eval_queries.json
+
+# Models
+models/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
